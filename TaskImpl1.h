@@ -39,6 +39,12 @@ namespace task {
 	InProgress,
 	Completed,
 	};
+	enum class TaskStatusOperation {
+	Resume,
+	Wait,
+	Complete,
+	Terminate,
+	};
 	class Task;
 
 	class TaskStrongHandle
@@ -102,8 +108,8 @@ namespace task {
 
 	  public:
 
-		// Return whether to start termination of the awaitor
-		virtual TaskStatus updateStatus() = 0;
+		// Return next task status operation
+		virtual TaskStatusOperation updateStatus(std::atomic<TaskStatus>& currentStatus) = 0;
 		virtual ~AwaitOperation() = default;
 	};
 
@@ -112,29 +118,80 @@ namespace task {
 		std::shared_ptr<Task> task;
 	  public:
 		AwaitSingle(std::shared_ptr<Task>&& t): task(t) {}
-		virtual TaskStatus updateStatus() final override {
-			return task->getStatus();
+		virtual TaskStatusOperation updateStatus(std::atomic<TaskStatus>& currentStatus) final override {
+			assert(currentStatus.load() != TaskStatus::Completed);
+			
+			TaskStatus targetStatus = task->getStatus();
+			// Check for termination first.
+			if (targetStatus == TaskStatus::Terminated) {
+				currentStatus.store(TaskStatus::Terminated);
+				task.reset();
+				return TaskStatusOperation::Terminate;
+			}
+			TaskStatus cStatus = currentStatus.load();
+			if (cStatus == TaskStatus::Terminated) {
+				task.reset();
+				return TaskStatusOperation::Terminate;
+			}
+			assert(cStatus == TaskStatus::InProgress);
+			if (targetStatus == TaskStatus::Completed) return TaskStatusOperation::Resume;
+			assert(targetStatus == TaskStatus::InProgress);
+			return TaskStatusOperation::Wait;
 		}
 		virtual ~AwaitSingle() final override = default;
 	};
 
-	class AwaitEither: public AwaitOperation
+	class AwaitAny: public AwaitOperation
 	{
 		std::vector<std::shared_ptr<Task>> tasks;
 
 	  public:
 		// TODO: Add more type??
-		AwaitEither(std::vector<std::shared_ptr<Task>>&& ts): tasks(std::move(ts)) {}
-		virtual TaskStatus updateStatus() final override {
-			bool anyInProgress = false;
-			for (auto& t : tasks) {
-				TaskStatus s = t->getStatus();
-				if (s == TaskStatus::Completed) return TaskStatus::Completed;
-				if (s == TaskStatus::InProgress) anyInProgress = true;
+		AwaitAny(std::vector<std::shared_ptr<Task>>&& ts): tasks(std::move(ts)) {}
+		virtual TaskStatusOperation updateStatus(std::atomic<TaskStatus>& currentStatus) final override {
+			assert(currentStatus.load() != TaskStatus::Completed);
+			
+			TaskStatus cStatus = currentStatus.load();
+			if (cStatus == TaskStatus::Terminated) {
+				tasks.clear();
+				return TaskStatusOperation::Terminate;
 			}
-			return anyInProgress ? TaskStatus::InProgress : TaskStatus::Terminated;
+			
+			TaskStatus targetStatus = TaskStatus::Terminated;
+			for (auto& t : tasks) {
+				if (!t) continue;
+				auto s = t->getStatus();
+				
+				if (s == TaskStatus::Terminated) {
+ 					t.reset();
+					continue;
+				} else if (s == TaskStatus::InProgress) {
+					targetStatus = TaskStatus::InProgress;
+					continue;
+				} else {
+					assert(s == TaskStatus::Completed);
+					targetStatus = TaskStatus::Completed;
+					if (&t != &tasks.front()) {
+						tasks.front() = std::move(t);
+					}
+					tasks.resize(1);
+					break;
+				}
+			}
+			
+			// Check for termination
+			if (targetStatus == TaskStatus::Terminated) {
+				currentStatus.store(TaskStatus::Terminated);
+				tasks.clear();
+				return TaskStatusOperation::Terminate;
+			}
+			
+			assert(cStatus == TaskStatus::InProgress);
+			if (targetStatus == TaskStatus::Completed) return TaskStatusOperation::Resume;
+			assert(targetStatus == TaskStatus::InProgress);
+			return TaskStatusOperation::Wait;
 		}
-		virtual ~AwaitEither() final override = default;
+		virtual ~AwaitAny() final override = default;
 	};
 
 	class AwaitAll: public AwaitOperation
@@ -144,15 +201,45 @@ namespace task {
 	  public:
 		// TODO: Add more type??
 		AwaitAll(std::vector<std::shared_ptr<Task>>&& ts): tasks(std::move(ts)) {}
-		virtual TaskStatus updateStatus() final override {
-			bool anyInProgress = false;
-			for (auto& t : tasks) {
-				TaskStatus s = t->getStatus();
-				if (s == TaskStatus::Terminated) return TaskStatus::Terminated;
-				if (s == TaskStatus::InProgress) anyInProgress = true;
+		virtual TaskStatusOperation updateStatus(std::atomic<TaskStatus>& currentStatus) final override {
+			assert(currentStatus.load() != TaskStatus::Completed);
+			
+			TaskStatus cStatus = currentStatus.load();
+			if (cStatus == TaskStatus::Terminated) {
+				tasks.clear();
+				return TaskStatusOperation::Terminate;
 			}
-			return anyInProgress ? TaskStatus::InProgress : TaskStatus::Completed;
+			
+			TaskStatus targetStatus = TaskStatus::Completed;
+			for (auto& t : tasks) {
+				assert(t);
+				auto s = t->getStatus();
+				
+				if (s == TaskStatus::Terminated) {
+					targetStatus = TaskStatus::Terminated;
+					break;
+				} else if (s == TaskStatus::InProgress) {
+					targetStatus = TaskStatus::InProgress;
+					continue;
+				} else {
+					assert(s == TaskStatus::Completed);
+					continue;
+				}
+			}
+			
+			// Check for termination
+			if (targetStatus == TaskStatus::Terminated) {
+				currentStatus.store(TaskStatus::Terminated);
+				tasks.clear();
+				return TaskStatusOperation::Terminate;
+			}
+			
+			assert(cStatus == TaskStatus::InProgress);
+			if (targetStatus == TaskStatus::Completed) return TaskStatusOperation::Resume;
+			assert(targetStatus == TaskStatus::InProgress);
+			return TaskStatusOperation::Wait;
 		}
+		vir
 		virtual ~AwaitAll() final override = default;
 	};
 }
@@ -189,8 +276,34 @@ namespace task {
 		std::weak_ptr<Task> awaitor;
 		std::unique_ptr<AwaitOperation> awaitee;
 		OneToOneTaskStrongHandle<T> getHandle() { return OneToOneTaskStrongHandle<T>(this->makeSharedPtr()); }
-		void resume() { HandleType::from_promise(*this).resume(); }
-
+		std::optional<TaskStrongHandle> resume() {
+			assert(awaitee);
+			TaskStatusOperation op = awaitee->updateStatus(status);
+			if (op == TaskStatusOperation::Resume) {
+				HandleType::from_promise(*this).resume();
+				resumeEnd();
+			}
+			switch (op) {
+			case TaskStatusOperation::Resume:
+				return {};
+			case TaskStatusOperation::Terminate:
+				awaitee.reset();
+				auto awaitorPtr = awaitor.lock();
+				if (!awaitorPtr) return {};
+				return awaitorPtr->tryClaimTask();
+			case TaskStatusOperation::Complete:
+				awaitee.reset();
+				auto awaitorPtr = awaitor.lock();
+				if (!awaitorPtr) return {};
+				return awaitorPtr->tryClaimTask();
+			}
+		}
+		std::optional<TaskStrongHandle> resumeEnd() {
+			if (awaitee) {
+				
+				
+			} else 
+		}
 	  public:
 		typedef std::coroutine_handle<OneToOneTask<T>> HandleType;
 		typedef T ValueType;
