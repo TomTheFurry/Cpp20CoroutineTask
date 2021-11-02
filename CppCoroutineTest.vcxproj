@@ -24,6 +24,7 @@
     <ProjectGuid>{2f8e9ca2-5ff7-4ae9-8fdc-76354a92d649}</ProjectGuid>
     <RootNamespace>CppCoroutineTest</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <ProjectName>Cpp20CoroutineTask</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
