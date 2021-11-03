@@ -4,6 +4,10 @@
 // Fix 1: Use std::shared_ptr && std::weak_ptr to safe-gaurd ownership. Assure
 // task destruction only when all awaitees are destructed or are relying on
 // other tasks
+
+//TODO: Redesign so that helping a coroutine doesn't require claiming it first.
+//TODO: Redesign so that you claim a task only when you want to really run its coroutine handle.
+//TODO: Allow multithreaded meta data updating, (Corespond to above redesign)
 #include <coroutine>
 #include <optional>
 #include <variant>
@@ -56,7 +60,7 @@ namespace task {
 		TaskHandle makeHandle(const TaskLink& ptr);
 		// Resume / run the task coroutine. Optionally return the next task to
 		// run
-		virtual std::variant<TaskHandle, UseItself> onResume() = 0;
+		virtual std::variant<TaskHandle, UseItself> onResume(bool tryClaimTask) = 0;
 		// Terminate / halt the task, by throwing an error to the func. All
 		// awaitors will also be terminated.
 		virtual TaskHandle onTerminate() = 0;
@@ -98,8 +102,9 @@ namespace task {
 		}
 		operator bool() const { return bool(task); }
 		bool hasValue() const { return bool(task); }
+		bool hasResult() const { return bool(*task); }
 		// Resume the task. Note that resuming completed task is invalid usage
-		std::variant<TaskHandle, UseItself> resume();
+		std::variant<TaskHandle, UseItself> resume(bool tryClaimTask = true);
 		// Terminate / halt the task, by throwing an error to the func. All
 		// awaitors will also be terminated.
 		TaskHandle terminate() { task->onTerminate(); }
@@ -107,8 +112,8 @@ namespace task {
 		// Destructor
 		~TaskHandle() { task ? task->onRelease() : void(); }
 	};
-	std::variant<TaskHandle, UseItself> TaskHandle::resume() {
-		return task->onResume();
+	std::variant<TaskHandle, UseItself> TaskHandle::resume(bool tryClaimTask) {
+		return task->onResume(tryClaimTask);
 	}
 
 	TaskHandle Task::makeHandle(const TaskLink& ptr) {
@@ -140,18 +145,24 @@ namespace task {
 	template<typename T> class BasicResultBox
 	{
 		T result;
-
+		//TODO: Prob should be atomic?
+		bool isDone = false;
+		
 	  public:
 		template<typename... Args> void return_value(Args&&... v) {
 			std::construct_at(&result, std::forward<Args>(v)...);
+			isDone = true;
 		}
 		T operator*() { return result; }
+		operator bool() const { return isDone; }
 	};
 	template<> class BasicResultBox<void>
 	{
+		bool isDone = false;
 	  public:
-		constexpr void return_void() {}
+		void return_void() { isDone = true; }
 		constexpr void operator*() {}
+		operator bool() const { return isDone; }
 	};
 
 	class AwaitOperation
@@ -166,37 +177,49 @@ namespace task {
 		virtual ~AwaitOperation() = default;
 	};
 
+	template<typename Future>
 	class AwaitSingle: public AwaitOperation
 	{
-		TaskRef task;
-
+		Future future;
 	  public:
-		AwaitSingle(TaskRef&& t): task(t) {}
+		AwaitSingle(Future&& f): future(f) {}
 		virtual AwaitResult updateStatus(
 		  std::atomic<TaskStatus>& currentStatus) final override {
 			assert(currentStatus.load() != TaskStatus::Completed);
 
-			TaskStatus targetStatus = task->getStatus();
+			TaskStatus targetStatus = future->getStatus();
 			// Check for termination first.
 			if (targetStatus == TaskStatus::Terminated)
 			{
 				currentStatus.store(TaskStatus::Terminated);
-				task.reset();
+				future.release();
 				return AwaitResultTerminate{};
 			}
 			TaskStatus cStatus = currentStatus.load();
 			if (cStatus == TaskStatus::Terminated)
 			{
-				task.reset();
+				future.release();
 				return AwaitResultTerminate{};
 			}
 			assert(cStatus == TaskStatus::InProgress);
 			if (targetStatus == TaskStatus::Completed)
 				return AwaitResultResume{};
 			assert(targetStatus == TaskStatus::InProgress);
-			return AwaitResultWait{task->tryClaimTask()};
+			return AwaitResultWait{future->tryClaimTask()};
 		}
 		virtual ~AwaitSingle() final override = default;
+		
+		
+		
+		bool await_ready() {
+			return future.hasResult();
+		}
+		std::coroutine_handle<> await_suspend() {
+			return future.onSuspend();
+		}
+		auto await_resume() {
+			return future.getResult();
+		}
 	};
 
 	class AwaitAny: public AwaitOperation
@@ -350,19 +373,19 @@ namespace task {
 		}
 
 	  protected:
-		virtual std::variant<TaskHandle, UseItself> onResume() final override {
+		virtual std::variant<TaskHandle, UseItself> onResume(bool tryClaimTask) final override {
 			assert(awaitee);
 			AwaitResult op = awaitee->updateStatus(status);
 
 			if (auto* v = std::get_if<AwaitResultWait>(&op))
-				return TaskHandle{std::move(v->nextTask)};
+				return tryClaimTask ? TaskHandle{std::move(v->nextTask)} : {};
 			if (auto* v = std::get_if<AwaitResultTerminate>(&op))
-				return _getAwaitorHandle();
+				return tryClaimTask ? _getAwaitorHandle() : {};
 			assert(std::get_if<AwaitResultResume>(&op) != nullptr);
 			HandleType::from_promise(*this).resume();
 			TaskStatus s = status.load();
-			if (s == task::TaskStatus::InProgress) return UseItself{};
-			return _getAwaitorHandle();
+			if (s == task::TaskStatus::InProgress) return tryClaimTask ? UseItself{} : {};
+			return tryClaimTask ? _getAwaitorHandle() : {};
 		}
 		// Terminate / halt the task. Awaitors and awaitees of this function may
 		// terminate.
@@ -389,9 +412,9 @@ namespace task {
 
 		template<typename U>
 		auto await_transform(OneToOneCoroutine<U>&& handle) {
-			TaskHandle t = handle->notifyNewAwaitor(this->getWeakPtr(), true);
-			awaitee = new AwaitSingle(std::move(handle));
-			return t;
+			//status.store(TaskStatus::InProgress);
+			awaitee = new AwaitSingle(std::move(handle)->toFuture());
+			return *awaitee;
 		}
 
 
@@ -422,9 +445,12 @@ namespace task {
 		}
 
 		// C++20 Coroutine func
-		TaskRef get_return_object() { return this->makeSharedPtr(); }
+		OneToOneCoroutine get_return_object() { return this->makeSharedPtr(); }
 		constexpr std::suspend_always initial_suspend() { return {}; }
-		constexpr std::suspend_always final_suspend() noexcept { return {}; }
+		constexpr std::suspend_always final_suspend() noexcept {
+			status.store(TaskStatus::Completed);
+			return {};
+		}
 
 		// For OneAwaiterOneResult, no await transform is needed
 		// For list of OneAwaiterOneResult:
@@ -432,23 +458,37 @@ namespace task {
 
 		void unhandled_exception() {}  // TODO
 	};
+	template<typename T> class OneToOneCoroutine : public std::shared_ptr<OneToOneTask<T>> {
+		using std::shared_ptr<OneToOneTask<T>>::shared_ptr;
+		public:
+		OneToOneTaskFuture<T> toFuture() && {
+			return OneToOneFuture<T>(std::move(*this));
+		}
+	}
+	
+	
 	template<typename T> class OneToOneTaskFuture
 	{
 		friend class OneToOneTask<T>;
-		std::variant<TaskHandle, TaskLink> task;
-		OneToOneTaskFuture(OneToOneCoroutine&& c, bool doClaimTask) {
-			TaskHandle t;
-			if (doClaimTask) t = c->tryClaimTask();
-			if (t) task = t else task = TaskLink(c);
+		OneToOneCoroutine task;
+		
+		OneToOneTaskFuture(OneToOneCoroutine&& task) : task(std::move(task)) {
+			//Immidiate try run it;
+			task->notifyNewAwaitor();
+			TaskHandle t = task->tryClaimTask();
+			t.resume(false);
 		}
 
 	  public:
-		std::false_type await_ready() {}
-		std::coroutine_handle<> await_suspend() {
-			if (auto* h = std::get_if<TaskHandle>(&task)) {
-				return h.
-			}
+		bool hasResult() const { return bool(*task); }
+		TaskStatus getStatus() const { return task->getStatus(); }
+		
+		
+		std::coroutine_handle<> onSuspend() {
+			TaskHandle t = task->tryClaimTask();
+			return t ? HandleType::from_promise(*task) : {};
 		}
-		T await_resume() = 0;
+		T getResult() { return **task; }
+		void release() { task.reset(); }
 	};
 }
