@@ -158,11 +158,17 @@
     <None Include=".clang-format" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="AtomicMarco.h" />
+    <ClInclude Include="Atomics.h" />
+    <ClInclude Include="AtomicStructure.h" />
     <ClInclude Include="Cowait.h" />
+    <ClInclude Include="InternalRunStack.h" />
     <ClInclude Include="JobSystem.h" />
     <ClInclude Include="Scheduler.h" />
     <ClInclude Include="Task.h" />
     <ClInclude Include="TaskImpl1.h" />
+    <ClInclude Include="TaskImpl2.h" />
+    <ClInclude Include="TaskImpl3.h" />
     <ClInclude Include="TaskManager.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
