@@ -59,5 +59,8 @@
     <ClInclude Include="AtomicMarco.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="vertify.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>
