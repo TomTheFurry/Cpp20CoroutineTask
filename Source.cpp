@@ -63,13 +63,16 @@ class DebugFloat
 	}
 
 	operator float() { return v; }
-	~DebugFloat() noexcept { v = std::nanf(""); }
+	~DebugFloat() noexcept {
+		v = std::nanf("");
+	}
 };
 
-constexpr auto THREAD_COUNT = 8uz;
-constexpr auto PUSH_POP_RATIO_A = 0.5;
-constexpr auto PUSH_POP_RATIO_B = 0.5;
-constexpr auto A_B_RATIO_SWITCH_COUNT = 5uz;
+constexpr auto THREAD_COUNT = 2uz;
+constexpr auto THREAD_BUSY_WORK = 0uz;
+constexpr auto PUSH_POP_RATIO_A = 0.95;
+constexpr auto PUSH_POP_RATIO_B = 0.05;
+constexpr auto A_B_RATIO_SWITCH_COUNT = 10uz;
 constexpr auto A_B_RATIO_SWITCH_LENGTH = std::chrono::seconds(1);
 static atomics::RingQueueBuffer<DebugFloat>* rqb = nullptr;
 static std::atomic<double> active_a_b_ratio = 0.0;
@@ -80,6 +83,13 @@ static std::atomic<ulint> addContentionOp{0};
 static std::atomic<ulint> subTotalOp{0};
 static std::atomic<ulint> subSuccessOp{0};
 static std::atomic<ulint> subContentionOp{0};
+static std::atomic<double> dummyValue{0};
+
+double dummyWork() {
+	double a = 0;
+	for (auto i = 0uz; i < THREAD_BUSY_WORK; i++) a += random<double>();
+	return a;
+}
 
 void controlThread() {
 	for (auto i = 0uz; i < A_B_RATIO_SWITCH_COUNT; i++)
@@ -101,12 +111,13 @@ void testThread(double v) {
 	ulint locSubTotalOp = 0;
 	ulint locSubSuccessOp = 0;
 	ulint locSubContentionOp = 0;
+	double dummyVal = 0;
 	while (!stopSignal.test(std::memory_order_relaxed))
 	{
 		bool isA = active_a_b_ratio.load(std::memory_order_relaxed) < v;
 		if (random(isA ? PUSH_POP_RATIO_A : PUSH_POP_RATIO_B))
 		{
-			atomics::Result worked = rqb->push(DebugFloat(random<float>()));
+			atomics::Result worked = rqb->push(DebugFloat(random<float>(-1.0f,1.0f)));
 			++locAddTotalOp;
 			if (worked == atomics::Result::Success) ++locAddSuccessOp;
 			if (worked == atomics::Result::Contention) ++locAddContentionOp;
@@ -120,6 +131,7 @@ void testThread(double v) {
 			if (worked == atomics::Result::Success) ++locSubSuccessOp;
 			if (worked == atomics::Result::Contention) ++locSubContentionOp;
 		}
+		dummyVal += dummyWork();
 	}
 	addTotalOp.fetch_add(locAddTotalOp, std::memory_order_relaxed);
 	addSuccessOp.fetch_add(locAddSuccessOp, std::memory_order_relaxed);
@@ -127,6 +139,7 @@ void testThread(double v) {
 	subTotalOp.fetch_add(locSubTotalOp, std::memory_order_relaxed);
 	subSuccessOp.fetch_add(locSubSuccessOp, std::memory_order_relaxed);
 	subContentionOp.fetch_add(locSubContentionOp, std::memory_order_relaxed);
+	dummyValue.fetch_add(dummyVal, std::memory_order_relaxed);
 }
 
 void atomicBuffTest() {

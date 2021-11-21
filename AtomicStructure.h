@@ -68,7 +68,6 @@ namespace atomics {
 		std::atomic<I> tail{0};	 // May wrap around
 
 	  public:
-
 		RingQueueBuffer() = default;
 		RingQueueBuffer(const RingQueueBuffer&) = delete;
 		RingQueueBuffer(RingQueueBuffer&&) = delete;
@@ -79,27 +78,39 @@ namespace atomics {
 		template<typename... Args> Result push(Args&&... args) {
 			auto l = mtxPush.tryGetLock();
 			if (!l) return Result::Contention;
-			auto t = tail.load(std::memory_order::acquire);
+
+			// No need for any read/write to previous head location
 			auto h = head.load(std::memory_order::relaxed);
+			// Aquire tail destruction when queue is near full and wraps around
+			auto t = tail.load(std::memory_order::relaxed);
 			// This should be fine even when the value wraps around
 			if (h - t >= N) return Result::FullOrEmpty;
+
 			std::construct_at(&buffer[h % N], std::forward<Args>(args)...);
+			// Release the just constructed object
 			head.store(h + 1, std::memory_order::release);
+
 			return Result::Success;
 		}
 		// Pops an element from the queue
 		std::variant<Result, T> pop() {
 			auto l = mtxPop.tryGetLock();
 			if (!l) return Result::Contention;
-			auto t = tail.load(std::memory_order::acquire);
-			auto h = head.load(std::memory_order::relaxed);
+
+			// No need for any read/write to the previous pop location
+			auto t = tail.load(std::memory_order::relaxed);
+			// Acquire the value just pushed to queue when it is nearly empty
+			auto h = head.load(std::memory_order::acquire);
 			// This should be fine even when the value wraps around
 			// h-t should never be negative as we have a lock on the pop and
 			// other threads should only be pushing new elements
 			if (h == t) return Result::FullOrEmpty;
+
 			auto r = std::variant<Result, T>(std::move(buffer[t % N]));
 			buffer[t % N].~T();
-			tail.store(t + 1, std::memory_order::release);
+			// Release the value changed after destruction
+			tail.store(t + 1, std::memory_order::relaxed);
+
 			return r;
 		}
 		// Get the number of elements (upper bound)
