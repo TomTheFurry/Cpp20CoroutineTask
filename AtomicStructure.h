@@ -3,6 +3,7 @@
 #include <concepts>
 #include <limits>
 #include <variant>
+#include <ranges>
 
 
 
@@ -78,25 +79,42 @@ namespace atomics {
 		template<typename... Args> Result push(Args&&... args) {
 			auto l = mtxPush.tryGetLock();
 			if (!l) return Result::Contention;
-
 			// No need for any read/write to previous head location
 			auto h = head.load(std::memory_order::relaxed);
 			// Aquire tail destruction when queue is near full and wraps around
 			auto t = tail.load(std::memory_order::relaxed);
 			// This should be fine even when the value wraps around
-			if (h - t >= N) return Result::FullOrEmpty;
-
+			if (h+1 - t > N) return Result::FullOrEmpty;
 			std::construct_at(&buffer[h % N], std::forward<Args>(args)...);
 			// Release the just constructed object
 			head.store(h + 1, std::memory_order::release);
-
 			return Result::Success;
 		}
+		Result pushMultiple(const std::ranges::range auto& r) {
+			size_t size = std::ranges::sized_range(r);
+			auto l = mtxPush.tryGetLock();
+			if (!l) return Result::Contention;
+			// No need for any read/write to previous head location
+			auto h = head.load(std::memory_order::relaxed);
+			// Aquire tail destruction when queue is near full and wraps around
+			auto t = tail.load(std::memory_order::relaxed);
+			// This should be fine even when the value wraps around
+			if (h+size - t > N) return Result::FullOrEmpty;
+			size_t s = 0;
+			for (auto& i : r)
+			{
+				std::construct_at(&buffer[(h + s) % N], i);
+				++s;
+			}
+			// Release the just constructed object
+			head.store(h + size, std::memory_order::release);
+			return Result::Success;
+		}
+
 		// Pops an element from the queue
 		std::variant<Result, T> pop() {
 			auto l = mtxPop.tryGetLock();
 			if (!l) return Result::Contention;
-
 			// No need for any read/write to the previous pop location
 			auto t = tail.load(std::memory_order::relaxed);
 			// Acquire the value just pushed to queue when it is nearly empty
@@ -105,12 +123,10 @@ namespace atomics {
 			// h-t should never be negative as we have a lock on the pop and
 			// other threads should only be pushing new elements
 			if (h == t) return Result::FullOrEmpty;
-
 			auto r = std::variant<Result, T>(std::move(buffer[t % N]));
 			buffer[t % N].~T();
 			// Release the value changed after destruction
 			tail.store(t + 1, std::memory_order::relaxed);
-
 			return r;
 		}
 		// Get the number of elements (upper bound)
